@@ -16,23 +16,30 @@ module uart2axi4 #(
     parameter  BYTE_WIDTH = 2,            // data width (bytes)
     parameter  A_WIDTH    = 32            // address width (bits)
 ) (
+    // System ----------------------
     input  wire                    rstn,
     input  wire                    clk,
     // AXI4 master ----------------------
+    //写地址
     input  wire                    awready,  // AW
     output wire                    awvalid,
     output wire      [A_WIDTH-1:0] awaddr,
     output wire             [ 7:0] awlen,
+    //写数据
     input  wire                    wready,   // W
     output wire                    wvalid,
     output wire                    wlast,
     output wire [8*BYTE_WIDTH-1:0] wdata,
+    //写响应
     output wire                    bready,   // B
     input  wire                    bvalid,
+    input  wire              [1:0] bresp,
+    //读地址
     input  wire                    arready,  // AR
     output wire                    arvalid,
     output wire      [A_WIDTH-1:0] araddr,
     output wire             [ 7:0] arlen,
+    //读数据
     output wire                    rready,   // R
     input  wire                    rvalid,
     input  wire                    rlast,
@@ -62,6 +69,8 @@ uart_rx #(
     .o_overflow                (                      )
 );
 
+//使用ASC码发送
+
 wire                   rx_space   = (rx_valid && (rx_byte == 8'h20));                        // " "
 wire                   rx_newline = (rx_valid && (rx_byte == 8'h0D || rx_byte == 8'h0A));    // \r, \n
 wire                   rx_char_w  = (rx_valid && (rx_byte == 8'h57 || rx_byte == 8'h77));    // W, w
@@ -77,7 +86,7 @@ reg             [ 8:0] len    = 9'h0;
 reg                    wwen   = 1'b0;
 reg [8*BYTE_WIDTH-1:0] wwdata = 0;
 reg             [ 7:0] wraddr = 8'h0;
-
+reg [1:0] response;
 
 localparam      [ 3:0] S_IDLE        = 4'd0,
                        S_PARSE_ADDR  = 4'd1,
@@ -97,6 +106,7 @@ reg             [ 3:0] state  = S_IDLE;
 
 always @ (posedge clk or negedge rstn)
     if (~rstn) begin
+        response<=2'b0;
         rwtype <= 1'b0;
         addr   <= 0;
         len    <= 9'h0;
@@ -133,7 +143,7 @@ always @ (posedge clk or negedge rstn)
                 else if (rx_valid)
                     state <= S_INVALID;
             
-            S_PARSE_LEN :
+            S_PARSE_LEN ://读取
                 if (rx_is_hex) begin
                     len   <= (len << 4);
                     len[3:0] <= rx_hex;
@@ -146,7 +156,7 @@ always @ (posedge clk or negedge rstn)
                     state <= S_INVALID;
                 end
             
-            S_PARSE_WDATA :
+            S_PARSE_WDATA ://写入
                 if (rx_is_hex) begin
                     wwen   <= 1'b1;
                     wwdata <= (wwdata << 4);
@@ -191,8 +201,10 @@ always @ (posedge clk or negedge rstn)
                 end
             
             S_AXI_B :
-                if (bvalid)
+                if (bvalid)begin 
                     state <= S_W_DONE;
+                    response <= bresp;
+                end
             
             S_W_DONE :
                 state <= S_IDLE;
@@ -236,12 +248,10 @@ assign wvalid  = (state == S_AXI_WDATA);
 assign wlast   = (wraddr >= len[7:0]);
 assign wdata   = wrdata;
 
-assign bready  = 1'b1;        // (state == S_AXI_B)
+//assign bready  = 1'b1;        // (state == S_AXI_B)
+assign bready  = (state == S_AXI_B);
 
-
-
-
-
+//该函数会把 4 位数值转换为对应的十六进制 ASCII 字符
 function  [7:0] toHex;
     input [3:0] val;
 begin
@@ -255,8 +265,19 @@ wire                      tx_failed = (state == S_FAILED);
 wire                      tx_number = (rvalid & rready);
 
 wire [8*2*BYTE_WIDTH-1:0] tx_data_failed = 64'h20_64_69_6C_61_76_6E_69;                                            // "invalid"
-wire [8*2*BYTE_WIDTH-1:0] tx_data_w_done = 64'h20_20_20_20_79_61_6B_6F;                                            // "okay"
+//wire [8*2*BYTE_WIDTH-1:0] tx_data_w_done = 64'h20_20_20_20_79_61_6B_6F;                                            // "okay"
+reg [8*2*BYTE_WIDTH-1:0] tx_data_w_done;       //response 2'b00:OKAY 2'b01:EXOKAY 2'b10:SLVERR 2'b11:DECERR
 wire [8*2*BYTE_WIDTH-1:0] tx_data_number;
+
+always@(*)begin
+    case(response)
+        2'b00:tx_data_w_done = 64'h20_20_20_59_41_4b_4f_20;                                      // " OKAY   "
+        2'b01:tx_data_w_done = 64'h20_59_41_4b_4f_58_45_20;                                      // " EXOKAY "
+        2'b10:tx_data_w_done = 64'h20_52_52_45_56_4c_53_20;                                      // " SLVERR "
+        2'b11:tx_data_w_done = 64'h20_52_52_45_43_45_44_20;                                      // " DECERR "
+        default:tx_data_w_done = 64'h20_20_20_20_20_20_20_20;                                    // "        "
+    endcase
+end
 
 wire                      tx_valid  = tx_failed | tx_w_done | tx_number;
 wire [8*2*BYTE_WIDTH-1:0] tx_data   = tx_failed ? tx_data_failed : tx_w_done ? tx_data_w_done : tx_data_number;
